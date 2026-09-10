@@ -37,6 +37,7 @@ enum PenColor: CaseIterable {
 enum DrawingTool: Equatable {
     case pen(PenColor)
     case eraser
+    case text
 
     var color: NSColor {
         switch self {
@@ -44,6 +45,8 @@ enum DrawingTool: Equatable {
             return penColor.color
         case .eraser:
             return .white
+        case .text:
+            return .black
         }
     }
 
@@ -53,6 +56,8 @@ enum DrawingTool: Equatable {
             return 4
         case .eraser:
             return 28
+        case .text:
+            return 0
         }
     }
 
@@ -62,6 +67,8 @@ enum DrawingTool: Equatable {
             return penColor.displayName
         case .eraser:
             return "Eraser"
+        case .text:
+            return "Text"
         }
     }
 }
@@ -96,15 +103,28 @@ enum DefaultAppearance: String {
 struct Stroke {
     let points: [CGPoint]
     let tool: DrawingTool
+    let width: CGFloat
+}
+
+struct TextItem {
+    let text: String
+    let origin: CGPoint
+    let penColor: PenColor
+    let fontSize: CGFloat
+}
+
+enum CanvasItem {
+    case stroke(Stroke)
+    case text(TextItem)
 }
 
 final class WhiteboardView: NSView {
     private enum HistoryAction {
-        case stroke(Stroke)
-        case clear([Stroke])
+        case add(CanvasItem)
+        case clear([CanvasItem])
     }
 
-    private var strokes: [Stroke] = []
+    private var items: [CanvasItem] = []
     private var undoHistory: [HistoryAction] = []
     private var redoHistory: [HistoryAction] = []
     private var currentStroke: [CGPoint] = []
@@ -121,9 +141,13 @@ final class WhiteboardView: NSView {
     override var isFlipped: Bool { true }
     var canUndoStroke: Bool { !undoHistory.isEmpty }
     var canRedoStroke: Bool { !redoHistory.isEmpty }
-    var canClear: Bool { !strokes.isEmpty || !currentStroke.isEmpty }
+    var canClear: Bool { !items.isEmpty || !currentStroke.isEmpty }
     private(set) var isDarkMode = false
     private(set) var activeTool: DrawingTool = .pen(.black)
+    private(set) var lastPenColor: PenColor = .black
+    private(set) var eraserWidth: CGFloat = DrawingTool.eraser.width
+    private(set) var textFontSize: CGFloat = 24
+    private var activeTextView: InlineTextView?
     var canvasBackgroundColor: NSColor {
         isDarkMode ? Self.darkCanvasColor : Self.lightCanvasColor
     }
@@ -136,6 +160,13 @@ final class WhiteboardView: NSView {
     private static let lightPrimaryPenColor = NSColor(calibratedWhite: 0.08, alpha: 1)
     private static let darkPrimaryPenColor = NSColor(calibratedWhite: 0.94, alpha: 1)
     private static let scrollZoomSensitivity: CGFloat = 0.02
+    private static let eraserScrollSensitivity: CGFloat = 0.4
+    private static let minEraserWidth: CGFloat = 8
+    private static let maxEraserWidth: CGFloat = 96
+    private static let textFontScrollSensitivity: CGFloat = 0.3
+    private static let minTextFontSize: CGFloat = 12
+    private static let maxTextFontSize: CGFloat = 72
+    private static let textBoxWidth: CGFloat = 280
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -151,19 +182,27 @@ final class WhiteboardView: NSView {
         canvasBackgroundColor.setFill()
         bounds.fill()
 
-        draw(strokes)
+        draw(items)
         drawCurrentStroke()
         drawToolPreview()
     }
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
+
+        guard activeTool != .text else {
+            beginTextSession(at: point)
+            return
+        }
+
         currentStroke = [point]
         toolPreviewPoint = point
         needsDisplay = true
     }
 
     override func mouseDragged(with event: NSEvent) {
+        guard activeTool != .text else { return }
+
         let point = convert(event.locationInWindow, from: nil)
         currentStroke.append(point)
         toolPreviewPoint = point
@@ -171,12 +210,15 @@ final class WhiteboardView: NSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        guard activeTool != .text else { return }
+
         let point = convert(event.locationInWindow, from: nil)
         currentStroke.append(point)
-        let stroke = Stroke(points: currentStroke, tool: activeTool)
+        let stroke = Stroke(points: currentStroke, tool: activeTool, width: effectiveWidth(for: activeTool))
+        let item = CanvasItem.stroke(stroke)
 
-        strokes.append(stroke)
-        undoHistory.append(.stroke(stroke))
+        items.append(item)
+        undoHistory.append(.add(item))
         redoHistory = []
         currentStroke = []
         toolPreviewPoint = point
@@ -262,10 +304,10 @@ final class WhiteboardView: NSView {
         guard let action = undoHistory.popLast() else { return }
 
         switch action {
-        case .stroke:
-            _ = strokes.popLast()
-        case .clear(let clearedStrokes):
-            strokes = clearedStrokes
+        case .add:
+            _ = items.popLast()
+        case .clear(let clearedItems):
+            items = clearedItems
         }
 
         redoHistory.append(action)
@@ -278,10 +320,10 @@ final class WhiteboardView: NSView {
         guard let action = redoHistory.popLast() else { return }
 
         switch action {
-        case .stroke(let stroke):
-            strokes.append(stroke)
+        case .add(let item):
+            items.append(item)
         case .clear:
-            strokes = []
+            items = []
         }
 
         undoHistory.append(action)
@@ -291,13 +333,15 @@ final class WhiteboardView: NSView {
 
     @objc
     func clear(_ sender: Any?) {
-        let clearedStrokes = strokes
+        let clearedItems = items
 
-        strokes = []
+        items = []
         currentStroke = []
         toolPreviewPoint = nil
-        if !clearedStrokes.isEmpty {
-            undoHistory.append(.clear(clearedStrokes))
+        activeTextView?.removeFromSuperview()
+        activeTextView = nil
+        if !clearedItems.isEmpty {
+            undoHistory.append(.clear(clearedItems))
             redoHistory = []
         }
         needsDisplay = true
@@ -326,14 +370,26 @@ final class WhiteboardView: NSView {
         var maxY = -CGFloat.greatestFiniteMagnitude
         var hasPoints = false
 
-        for stroke in strokes {
-            let radius = stroke.tool.width / 2
+        for item in items {
+            switch item {
+            case .stroke(let stroke):
+                let radius = stroke.width / 2
 
-            for point in stroke.points {
-                minX = min(minX, point.x - radius)
-                minY = min(minY, point.y - radius)
-                maxX = max(maxX, point.x + radius)
-                maxY = max(maxY, point.y + radius)
+                for point in stroke.points {
+                    minX = min(minX, point.x - radius)
+                    minY = min(minY, point.y - radius)
+                    maxX = max(maxX, point.x + radius)
+                    maxY = max(maxY, point.y + radius)
+                    hasPoints = true
+                }
+            case .text(let textItem):
+                let size = textItem.text.size(withAttributes: [.font: NSFont.systemFont(ofSize: textItem.fontSize)])
+                let rect = NSRect(origin: textItem.origin, size: size)
+
+                minX = min(minX, rect.minX)
+                minY = min(minY, rect.minY)
+                maxX = max(maxX, rect.maxX)
+                maxY = max(maxY, rect.maxY)
                 hasPoints = true
             }
         }
@@ -354,6 +410,14 @@ final class WhiteboardView: NSView {
     }
 
     func setActiveTool(_ tool: DrawingTool) {
+        if tool != .text, activeTextView != nil {
+            window?.makeFirstResponder(self)
+        }
+
+        if case .pen(let penColor) = tool {
+            lastPenColor = penColor
+        }
+
         activeTool = tool
         needsDisplay = true
         onToolChanged?()
@@ -376,6 +440,34 @@ final class WhiteboardView: NSView {
             return penColor.color
         case .eraser:
             return canvasBackgroundColor
+        case .text:
+            return primaryPenColor
+        }
+    }
+
+    func effectiveWidth(for tool: DrawingTool) -> CGFloat {
+        switch tool {
+        case .eraser:
+            return eraserWidth
+        case .pen:
+            return tool.width
+        case .text:
+            return textFontSize
+        }
+    }
+
+    func adjustEraserWidth(byScrollDelta delta: CGFloat) {
+        let proposedWidth = eraserWidth + delta * Self.eraserScrollSensitivity
+        eraserWidth = min(max(proposedWidth, Self.minEraserWidth), Self.maxEraserWidth)
+    }
+
+    func adjustTextFontSize(byScrollDelta delta: CGFloat) {
+        let proposedSize = textFontSize + delta * Self.textFontScrollSensitivity
+        textFontSize = min(max(proposedSize, Self.minTextFontSize), Self.maxTextFontSize)
+
+        if let activeTextView {
+            activeTextView.font = .systemFont(ofSize: textFontSize)
+            resizeActiveTextView()
         }
     }
 
@@ -455,28 +547,42 @@ final class WhiteboardView: NSView {
         needsDisplay = true
     }
 
-    private func draw(_ strokes: [Stroke]) {
-        for stroke in strokes {
-            draw(points: stroke.points, tool: stroke.tool)
+    private func draw(_ items: [CanvasItem]) {
+        for item in items {
+            switch item {
+            case .stroke(let stroke):
+                draw(points: stroke.points, tool: stroke.tool, width: stroke.width)
+            case .text(let textItem):
+                drawText(textItem)
+            }
         }
     }
 
-    private func drawCurrentStroke() {
-        draw(points: currentStroke, tool: activeTool)
+    private func drawText(_ item: TextItem) {
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: item.fontSize),
+            .foregroundColor: renderedColor(for: .pen(item.penColor))
+        ]
+
+        NSAttributedString(string: item.text, attributes: attributes).draw(at: item.origin)
     }
 
-    private func draw(points: [CGPoint], tool: DrawingTool) {
+    private func drawCurrentStroke() {
+        draw(points: currentStroke, tool: activeTool, width: effectiveWidth(for: activeTool))
+    }
+
+    private func draw(points: [CGPoint], tool: DrawingTool, width: CGFloat) {
         guard let firstPoint = points.first else { return }
 
         let strokeColor = renderedColor(for: tool)
 
         if points.allSatisfy({ $0 == firstPoint }) {
-            let radius = tool.width / 2
+            let radius = width / 2
             let dotRect = NSRect(
                 x: firstPoint.x - radius,
                 y: firstPoint.y - radius,
-                width: tool.width,
-                height: tool.width
+                width: width,
+                height: width
             )
 
             strokeColor.setFill()
@@ -485,7 +591,7 @@ final class WhiteboardView: NSView {
         }
 
         let path = NSBezierPath()
-        path.lineWidth = tool.width
+        path.lineWidth = width
         path.lineCapStyle = .round
         path.lineJoinStyle = .round
         path.move(to: firstPoint)
@@ -503,14 +609,15 @@ final class WhiteboardView: NSView {
     }
 
     private func drawToolPreview() {
-        guard let point = toolPreviewPoint else { return }
+        guard activeTool != .text, let point = toolPreviewPoint else { return }
 
-        let radius = activeTool.width / 2
+        let width = effectiveWidth(for: activeTool)
+        let radius = width / 2
         let previewRect = NSRect(
             x: point.x - radius,
             y: point.y - radius,
-            width: activeTool.width,
-            height: activeTool.width
+            width: width,
+            height: width
         )
         let previewPath = NSBezierPath(ovalIn: previewRect)
         let previewColor = activeTool == .eraser
@@ -523,6 +630,91 @@ final class WhiteboardView: NSView {
         previewPath.lineWidth = 1
         previewPath.stroke()
     }
+
+    private func beginTextSession(at point: CGPoint) {
+        window?.makeFirstResponder(self)
+
+        let textView = InlineTextView(frame: NSRect(
+            origin: point,
+            size: NSSize(width: Self.textBoxWidth, height: textFontSize + 8)
+        ))
+        textView.string = ""
+        textView.font = .systemFont(ofSize: textFontSize)
+        textView.textColor = renderedColor(for: .pen(lastPenColor))
+        textView.drawsBackground = false
+        textView.isRichText = false
+        textView.textContainerInset = .zero
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.textContainer?.widthTracksTextView = true
+        textView.delegate = self
+        textView.onResignFirstResponder = { [weak self] in
+            self?.commitActiveTextSession()
+        }
+
+        addSubview(textView)
+        activeTextView = textView
+        window?.makeFirstResponder(textView)
+    }
+
+    private func resizeActiveTextView() {
+        guard
+            let activeTextView,
+            let layoutManager = activeTextView.layoutManager,
+            let textContainer = activeTextView.textContainer
+        else { return }
+
+        layoutManager.ensureLayout(for: textContainer)
+        let usedHeight = layoutManager.usedRect(for: textContainer).height
+        let newHeight = max(textFontSize + 8, usedHeight)
+
+        if activeTextView.frame.height != newHeight {
+            activeTextView.setFrameSize(NSSize(width: activeTextView.frame.width, height: newHeight))
+        }
+    }
+
+    private func commitActiveTextSession() {
+        guard let textView = activeTextView else { return }
+
+        let text = textView.string.trimmingCharacters(in: .whitespacesAndNewlines)
+        let origin = textView.frame.origin
+
+        textView.removeFromSuperview()
+        activeTextView = nil
+
+        guard !text.isEmpty else {
+            needsDisplay = true
+            return
+        }
+
+        let item = CanvasItem.text(TextItem(
+            text: text,
+            origin: origin,
+            penColor: lastPenColor,
+            fontSize: textFontSize
+        ))
+
+        items.append(item)
+        undoHistory.append(.add(item))
+        redoHistory = []
+        needsDisplay = true
+        onHistoryChanged?()
+    }
+}
+
+extension WhiteboardView: NSTextViewDelegate {
+    func textDidChange(_ notification: Notification) {
+        resizeActiveTextView()
+        needsDisplay = true
+    }
+
+    func textView(_ textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+        guard selector == #selector(NSResponder.cancelOperation(_:)) else { return false }
+
+        window?.makeFirstResponder(self)
+        return true
+    }
 }
 
 final class CanvasClipView: NSClipView {
@@ -533,6 +725,28 @@ final class CanvasClipView: NSClipView {
 
     override func resetCursorRects() {
         addCursorRect(bounds, cursor: Self.invisibleCursor)
+    }
+}
+
+final class ToolbarView: NSVisualEffectView {
+    var onScroll: ((NSEvent) -> Void)?
+
+    override func scrollWheel(with event: NSEvent) {
+        onScroll?(event)
+    }
+}
+
+final class InlineTextView: NSTextView {
+    var onResignFirstResponder: (() -> Void)?
+
+    override func resignFirstResponder() -> Bool {
+        let didResign = super.resignFirstResponder()
+
+        if didResign {
+            onResignFirstResponder?()
+        }
+
+        return didResign
     }
 }
 
@@ -556,6 +770,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var redPenButton: NSButton?
     private var greenPenButton: NSButton?
     private var eraserButton: NSButton?
+    private var textButton: NSButton?
     private var toolStatusLabel: NSTextField?
     private var undoMenuItem: NSMenuItem?
     private var redoMenuItem: NSMenuItem?
@@ -856,6 +1071,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         scrollView.setMagnification(clampedValue, centeredAt: visibleCenter)
     }
 
+    private func handleToolbarScroll(_ event: NSEvent) {
+        guard event.scrollingDeltaY != 0 else { return }
+
+        switch canvas?.activeTool {
+        case .eraser:
+            canvas?.adjustEraserWidth(byScrollDelta: event.scrollingDeltaY)
+        case .text:
+            canvas?.adjustTextFontSize(byScrollDelta: event.scrollingDeltaY)
+        default:
+            return
+        }
+    }
+
     @objc
     private func selectBlackPen(_ sender: Any?) {
         selectPen(.black)
@@ -884,6 +1112,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc
     private func selectEraser(_ sender: Any?) {
         canvas?.setActiveTool(.eraser)
+        window?.makeFirstResponder(canvas)
+    }
+
+    @objc
+    private func selectText(_ sender: Any?) {
+        canvas?.setActiveTool(.text)
         window?.makeFirstResponder(canvas)
     }
 
@@ -932,10 +1166,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func makeToolbar() -> NSView {
-        let toolbar = NSVisualEffectView()
+        let toolbar = ToolbarView()
         toolbar.material = .underWindowBackground
         toolbar.blendingMode = .withinWindow
         toolbar.state = .active
+        toolbar.onScroll = { [weak self] event in
+            self?.handleToolbarScroll(event)
+        }
 
         let appControlsStack = NSStackView()
         appControlsStack.orientation = .horizontal
@@ -999,6 +1236,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             accessibilityDescription: "Eraser",
             action: #selector(AppDelegate.selectEraser(_:))
         )
+        let textButton = makeToolbarButton(
+            symbolName: "textformat",
+            accessibilityDescription: "Text",
+            action: #selector(AppDelegate.selectText(_:))
+        )
 
         let separator = NSBox()
         separator.boxType = .separator
@@ -1020,6 +1262,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         drawingControlsStack.addArrangedSubview(redPenButton)
         drawingControlsStack.addArrangedSubview(greenPenButton)
         drawingControlsStack.addArrangedSubview(eraserButton)
+        drawingControlsStack.addArrangedSubview(textButton)
         drawingControlsStack.addArrangedSubview(penIndicator)
         toolbar.addSubview(appControlsStack)
         toolbar.addSubview(drawingControlsStack)
@@ -1045,6 +1288,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             greenPenButton.heightAnchor.constraint(equalToConstant: 32),
             eraserButton.widthAnchor.constraint(equalToConstant: 32),
             eraserButton.heightAnchor.constraint(equalToConstant: 32),
+            textButton.widthAnchor.constraint(equalToConstant: 32),
+            textButton.heightAnchor.constraint(equalToConstant: 32),
             penIndicator.widthAnchor.constraint(equalToConstant: 92),
             separator.heightAnchor.constraint(equalToConstant: 22),
             appControlsStack.leadingAnchor.constraint(equalTo: toolbar.leadingAnchor, constant: 14),
@@ -1064,6 +1309,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.redPenButton = redPenButton
         self.greenPenButton = greenPenButton
         self.eraserButton = eraserButton
+        self.textButton = textButton
         self.toolStatusLabel = penIndicator
 
         return toolbar
@@ -1154,6 +1400,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         greenPenButton?.state = activeTool == .pen(.green) ? .on : .off
         eraserButton?.state = activeTool == .eraser ? .on : .off
         eraserButton?.contentTintColor = activeTool == .eraser ? .controlAccentColor : .labelColor
+        textButton?.state = activeTool == .text ? .on : .off
+        textButton?.contentTintColor = activeTool == .text ? .controlAccentColor : .labelColor
         toolStatusLabel?.stringValue = activeTool.displayName
     }
 
