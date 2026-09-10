@@ -135,6 +135,7 @@ final class WhiteboardView: NSView {
     private static let darkCanvasColor = NSColor(calibratedWhite: 0.06, alpha: 1)
     private static let lightPrimaryPenColor = NSColor(calibratedWhite: 0.08, alpha: 1)
     private static let darkPrimaryPenColor = NSColor(calibratedWhite: 0.94, alpha: 1)
+    private static let scrollZoomSensitivity: CGFloat = 0.02
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -219,6 +220,27 @@ final class WhiteboardView: NSView {
     override func mouseExited(with event: NSEvent) {
         toolPreviewPoint = nil
         needsDisplay = true
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        guard
+            event.modifierFlags.contains(.command),
+            event.scrollingDeltaY != 0,
+            let scrollView = enclosingScrollView
+        else {
+            super.scrollWheel(with: event)
+            return
+        }
+
+        let point = convert(event.locationInWindow, from: nil)
+        let factor = exp(event.scrollingDeltaY * Self.scrollZoomSensitivity)
+        let targetMagnification = scrollView.magnification * factor
+        let clampedMagnification = min(
+            max(targetMagnification, scrollView.minMagnification),
+            scrollView.maxMagnification
+        )
+
+        scrollView.setMagnification(clampedMagnification, centeredAt: point)
     }
 
     override func updateTrackingAreas() {
@@ -516,6 +538,10 @@ final class CanvasClipView: NSClipView {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private static let minMagnification: CGFloat = 0.1
+    private static let maxMagnification: CGFloat = 4.0
+    private static let zoomStep: CGFloat = 1.25
+
     private let canvasSize = NSSize(width: 5000, height: 5000)
     private let minimumContentSize = NSSize(width: 640, height: 360)
     private var window: NSWindow?
@@ -804,6 +830,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc
+    private func zoomIn(_ sender: Any?) {
+        setMagnification((scrollView?.magnification ?? 1) * Self.zoomStep)
+    }
+
+    @objc
+    private func zoomOut(_ sender: Any?) {
+        setMagnification((scrollView?.magnification ?? 1) / Self.zoomStep)
+    }
+
+    @objc
+    private func resetZoom(_ sender: Any?) {
+        setMagnification(1)
+    }
+
+    private func setMagnification(_ value: CGFloat) {
+        guard let scrollView else { return }
+
+        let clampedValue = min(max(value, Self.minMagnification), Self.maxMagnification)
+        let visibleCenter = NSPoint(
+            x: scrollView.documentVisibleRect.midX,
+            y: scrollView.documentVisibleRect.midY
+        )
+
+        scrollView.setMagnification(clampedValue, centeredAt: visibleCenter)
+    }
+
+    @objc
     private func selectBlackPen(_ sender: Any?) {
         selectPen(.black)
     }
@@ -853,6 +906,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         scrollView.automaticallyAdjustsContentInsets = false
         scrollView.contentInsets = NSEdgeInsets(top: 0, left: 0, bottom: 0, right: 0)
         scrollView.scrollerInsets = NSEdgeInsetsZero
+        scrollView.allowsMagnification = true
+        scrollView.minMagnification = Self.minMagnification
+        scrollView.maxMagnification = Self.maxMagnification
         scrollView.contentView = CanvasClipView()
         scrollView.documentView = canvas
         self.scrollView = scrollView
@@ -1148,6 +1204,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         fileMenuItem.submenu = fileMenu
         mainMenu.addItem(fileMenuItem)
+
+        let zoomInItem = viewMenu.addItem(
+            withTitle: "Zoom In",
+            action: #selector(AppDelegate.zoomIn(_:)),
+            keyEquivalent: "="
+        )
+        zoomInItem.target = self
+
+        let zoomOutItem = viewMenu.addItem(
+            withTitle: "Zoom Out",
+            action: #selector(AppDelegate.zoomOut(_:)),
+            keyEquivalent: "-"
+        )
+        zoomOutItem.target = self
+
+        let actualSizeItem = viewMenu.addItem(
+            withTitle: "Actual Size",
+            action: #selector(AppDelegate.resetZoom(_:)),
+            keyEquivalent: "0"
+        )
+        actualSizeItem.target = self
+
+        viewMenu.addItem(.separator())
 
         let fullScreenItem = viewMenu.addItem(
             withTitle: "Enter Full Screen",
